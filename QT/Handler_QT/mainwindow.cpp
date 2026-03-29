@@ -462,22 +462,9 @@ bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *re
 
 void MainWindow::renderRgb565Frame(const QByteArray &frame)
 {
-    if (rgb565LeFrame.size() != VIDEO_FRAME_BYTES)
-    {
-        rgb565LeFrame.resize(VIDEO_FRAME_BYTES);
-    }
-
-    const uint8_t *src = reinterpret_cast<const uint8_t *>(frame.constData());
-    uint8_t *dst = reinterpret_cast<uint8_t *>(rgb565LeFrame.data());
-
-    /* Camera stream is big-endian RGB565; Qt RGB16 expects little-endian words on Windows. */
-    for (int i = 0; i < VIDEO_FRAME_BYTES; i += 2)
-    {
-        dst[i] = src[i + 1];
-        dst[i + 1] = src[i];
-    }
-
-    QImage img(reinterpret_cast<const uchar *>(rgb565LeFrame.constData()),
+    /* OV2640 with 0xDA=0x09 outputs byte-swapped (little-endian) RGB565,
+     * which matches Qt's Format_RGB16 on little-endian hosts directly. */
+    QImage img(reinterpret_cast<const uchar *>(frame.constData()),
                IMG_WIDTH,
                IMG_HEIGHT,
                IMG_WIDTH * 2,

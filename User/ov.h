@@ -99,12 +99,11 @@ typedef volatile unsigned long  *PUINT32V;
 #endif
 
 
-/* Active RGB565 output requested from the OV2640 scaler.
- * Current measured stable mode is 240x125 on the target hardware.
- */
+/* RGB565 output: 240x320 (matching reference DVP_UART configuration). */
 #define OV2640_RGB565_WIDTH    240
-#define OV2640_RGB565_HEIGHT   125
-#define OV2640_RGB565_SENSOR_HEIGHT 128
+#define OV2640_RGB565_HEIGHT   320
+#define RGB565_ROW_NUM         320
+#define RGB565_COL_NUM         480   //Width * 2
 #define OV2640_RGB565_LINE_BYTES   (OV2640_RGB565_WIDTH * 2)
 
 //JPEG PIXEL 1024 * 768

@@ -82,11 +82,10 @@ const UINT8 OV2640_JPEGRegTbl[][2]=
 };
 
 /* RGB565 */
-/* RGB565 */
 const UINT8 OV2640_RGB565RegTbl[][2]=
 {
-    0xFF, 0x00, 0xDA, 0x08, 0xD7, 0x03, 0xDF, 0x02, 0x33, 0xa0, 0x3C, 0x00, 0xe1, 0x67,
-    0xff, 0x01, 0xe0, 0x00, 0xe1, 0x00, 0xe5, 0x00, 0xd7, 0x00, 0xda, 0x00, 0xe0, 0x00,
+	0xFF, 0x00,	0xDA, 0x09,	0xD7, 0x03,	0xDF, 0x02,	0x33, 0xa0,	0x3C, 0x00,	0xe1, 0x67,
+	0xff, 0x01,	0xe0, 0x00,	0xe1, 0x00,	0xe5, 0x00,	0xd7, 0x00,	0xda, 0x00,	0xe0, 0x00,
 };
 /*********************************************************************
  * @fn      SCCB_GPIO_Init
@@ -388,19 +387,9 @@ UINT8 OV2640_Init(void)
  */
 void RGB565_Mode_Init(void)
 {
-	/* Use a scaler-programmable height and keep the transport cropped to the measured 125 rows. */
-	#define OV2640_RGB565_PCLK_DIV 12
-	#define OV2640_RGB565_XCLK_DIV 0
-
 	OV2640_RGB565_Mode();
-	if (OV2640_OutSize_Set(OV2640_RGB565_WIDTH, OV2640_RGB565_SENSOR_HEIGHT) != 0)
-	{
-		printf("[ov] invalid RGB565 size %ux%u\r\n",
-		       (unsigned int)OV2640_RGB565_WIDTH,
-		       (unsigned int)OV2640_RGB565_SENSOR_HEIGHT);
-	}
-	OV2640_Speed_Set(OV2640_RGB565_PCLK_DIV, OV2640_RGB565_XCLK_DIV);
-	OV2640_LogCurrentSize();
+	OV2640_OutSize_Set(OV2640_RGB565_WIDTH, OV2640_RGB565_HEIGHT);
+	OV2640_Speed_Set(28, 1);
 }
 
 /*********************************************************************
@@ -510,7 +499,7 @@ void OV2640_LogCurrentSize(void)
 
 	printf("[ov] req=%ux%u reg5a=0x%02x reg5b=0x%02x reg5c=0x%02x pclk=0x%02x xclk=0x%02x\r\n",
 	       (unsigned int)OV2640_RGB565_WIDTH,
-	       (unsigned int)OV2640_RGB565_SENSOR_HEIGHT,
+	       (unsigned int)OV2640_RGB565_HEIGHT,
 	       (unsigned int)zmow,
 	       (unsigned int)zmoh,
 	       (unsigned int)zmhh,

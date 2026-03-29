@@ -32,9 +32,9 @@ struct libusb_device_handle;
 #define USB_REQUEST_TYPE_VENDOR_OUT 0x40
 #define DISPLAY_MODE_VIDEO 3
 
-/* Camera frame constants (RGB565 240x125, assembled on host). */
+/* Camera frame constants (RGB565 240x320, assembled on host). */
 #define IMG_WIDTH 240
-#define IMG_HEIGHT 125
+#define IMG_HEIGHT 320
 #define VIDEO_ROW_HDR_BYTES 7
 #define VIDEO_ROW_PACKET_BYTES (VIDEO_ROW_HDR_BYTES + (IMG_WIDTH * 2))
 #define VIDEO_FRAME_BYTES (IMG_WIDTH * IMG_HEIGHT * 2)
