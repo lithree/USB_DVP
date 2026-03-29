@@ -11,8 +11,8 @@
 *******************************************************************************/
 #include "ov.h"
 
-#define OV2640_RGB565_PCLK_DIV 2
-#define OV2640_RGB565_XCLK_DIV 1
+#define OV2640_RGB565_PCLK_DIV 0
+#define OV2640_RGB565_XCLK_DIV 2
 
 /* Start Camera list of initialization configuration registers */
 const UINT8 OV2640_InitRegTbl[][2]=

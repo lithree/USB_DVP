@@ -3,7 +3,9 @@
 #include "usb_routine.h"
 #include "string.h"
 
-extern __attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * 2];
+#define DVP_LINE_BUFFER_COUNT 8
+
+extern __attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * DVP_LINE_BUFFER_COUNT];
 extern volatile uint8_t frame_capture_done;
 extern void DVP_ResetCaptureState(void);
 extern void UART6_Printf(char *format, ...);
@@ -159,7 +161,8 @@ void USB_bulk_data_handler(void)
         {
             if (usb_tx_row < addr_cnt)
             {
-                uint8_t *row_ptr = (usb_tx_row & 1U) ? &image_buffer[LINE_BYTES] : &image_buffer[0];
+                uint32_t slot = usb_tx_row % DVP_LINE_BUFFER_COUNT;
+                uint8_t *row_ptr = &image_buffer[slot * LINE_BYTES];
                 uint16_t remain = (uint16_t)(LINE_BYTES - usb_tx_row_offset);
                 uint16_t tx_len = remain;
 
@@ -207,7 +210,7 @@ void USB_bulk_data_handler(void)
                 }
 
                 /* Resume DVP capture */
-                if ((frame_capture_done == 0U) && ((addr_cnt - usb_rows_sent) < 2U) &&
+                if ((frame_capture_done == 0U) && ((addr_cnt - usb_rows_sent) < DVP_LINE_BUFFER_COUNT) &&
                     ((DVP->CR0 & RB_DVP_ENABLE) == 0U) && (addr_cnt < IMG_HEIGHT))
                 {
                     DVP->CR0 |= RB_DVP_ENABLE;

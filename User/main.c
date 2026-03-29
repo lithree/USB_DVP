@@ -9,8 +9,14 @@
 
 #define DVP_Work_Mode    RGB565_MODE
 
-/* DVP Image buffer */
-__attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * 2];
+#define DVP_LINE_BUFFER_COUNT 8
+
+#if (DVP_LINE_BUFFER_COUNT < 2) || ((DVP_LINE_BUFFER_COUNT & 1) != 0)
+#error "DVP_LINE_BUFFER_COUNT must be even and >= 2"
+#endif
+
+/* DMA buffer. */
+__attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * DVP_LINE_BUFFER_COUNT];
 
 volatile UINT32 frame_cnt = 0;
 volatile UINT32 addr_cnt = 0;
@@ -146,6 +152,22 @@ void DVP_IRQHandler(void)
 
         addr_cnt++;
 
+        /* BUF0: even slots, BUF1: odd slots */
+        {
+            uint32_t completed_row = addr_cnt - 1U;
+            uint32_t next_slot = (completed_row + 2U) % DVP_LINE_BUFFER_COUNT;
+            uint32_t next_addr = (uint32_t)&image_buffer[next_slot * LINE_BYTES];
+
+            if ((completed_row & 1U) == 0U)
+            {
+                DVP->DMA_BUF0 = next_addr;
+            }
+            else
+            {
+                DVP->DMA_BUF1 = next_addr;
+            }
+        }
+
         /* Transfer sufficient line, mark done */
         if ((frame_capture_done == 0U) && (addr_cnt >= IMG_HEIGHT))
         {
@@ -153,7 +175,7 @@ void DVP_IRQHandler(void)
         }
 
         /* Pause capture if DVP buffers are full. */
-        if ((frame_capture_done == 0U) && ((addr_cnt - usb_rows_sent) >= 2U))
+        if ((frame_capture_done == 0U) && ((addr_cnt - usb_rows_sent) >= DVP_LINE_BUFFER_COUNT))
         {
             DVP->CR0 &= ~RB_DVP_ENABLE;
         }
