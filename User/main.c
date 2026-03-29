@@ -9,19 +9,8 @@
 
 #define DVP_Work_Mode    RGB565_MODE
 
-/* Resolution */
-#define IMG_WIDTH  OV2640_RGB565_WIDTH
-#define IMG_HEIGHT OV2640_RGB565_HEIGHT
-
-#define LINE_BYTES (IMG_WIDTH * 2)
-#define DVP_LINE_BUFFER_COUNT 8
-
-#if (DVP_LINE_BUFFER_COUNT < 2) || ((DVP_LINE_BUFFER_COUNT & 1) != 0)
-#error "DVP_LINE_BUFFER_COUNT must be even and >= 2"
-#endif
-
-/* 8-line ring DMA buffer (4x deeper than the original 2-line ping-pong). */
-__attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * DVP_LINE_BUFFER_COUNT];
+/* DVP Image buffer */
+__attribute__((aligned(4))) uint8_t image_buffer[LINE_BYTES * 2];
 
 volatile UINT32 frame_cnt = 0;
 volatile UINT32 addr_cnt = 0;
@@ -30,9 +19,7 @@ volatile uint8_t frame_capture_done = 0;
 volatile uint32_t dvp_fifo_overflow_cnt = 0;
 volatile uint32_t dvp_frame_done_cnt = 0;
 volatile uint32_t dvp_frame_stop_cnt = 0;
-volatile uint32_t dvp_short_stop_ignored_cnt = 0;
 volatile uint32_t usb_rows_sent = 0;
-volatile uint32_t dvp_last_frame_rows = 0;
 
 void DVP_IRQHandler (void) __attribute__((interrupt("WCH-Interrupt-fast")));
 
@@ -43,7 +30,6 @@ void DVP_ResetCaptureState(void)
     DVP->IFR = 0;
     addr_cnt = 0;
     href_cnt = 0;
-    usb_rows_sent = 0;
     frame_capture_done = 0;
 }
 
@@ -160,30 +146,16 @@ void DVP_IRQHandler(void)
 
         addr_cnt++;
 
-        /* Rotate DMA targets across an 8-line ring (BUF0: even slots, BUF1: odd slots). */
+        /* Transfer sufficient line, mark done */
+        if ((frame_capture_done == 0U) && (addr_cnt >= IMG_HEIGHT))
         {
-            uint32_t completed_row = addr_cnt - 1U;
-            uint32_t next_slot = (completed_row + 2U) % DVP_LINE_BUFFER_COUNT;
-            uint32_t next_addr = (uint32_t)&image_buffer[next_slot * LINE_BYTES];
-
-            if ((completed_row & 1U) == 0U)
-            {
-                DVP->DMA_BUF0 = next_addr;
-            }
-            else
-            {
-                DVP->DMA_BUF1 = next_addr;
-            }
+            mark_done = 1;
         }
 
-        /* Backpressure: pause capture if the 8-line ring is full. */
-        if (frame_capture_done == 0U)
+        /* Pause capture if DVP buffers are full. */
+        if ((frame_capture_done == 0U) && ((addr_cnt - usb_rows_sent) >= 2U))
         {
-            uint32_t pending_rows = (addr_cnt > usb_rows_sent) ? (addr_cnt - usb_rows_sent) : 0U;
-            if (pending_rows >= DVP_LINE_BUFFER_COUNT)
-            {
-                DVP->CR0 &= ~RB_DVP_ENABLE;
-            }
+            DVP->CR0 &= ~RB_DVP_ENABLE;
         }
     }
 
@@ -199,30 +171,21 @@ void DVP_IRQHandler(void)
         DVP->IFR &= ~RB_DVP_IF_STR_FRM;
 
         frame_cnt++;
-        /* Ignore intermediate STR_FRM while a logical frame is still in progress. */
-        if ((frame_capture_done != 0U) || (addr_cnt == 0U))
-        {
-            addr_cnt = 0;
-            href_cnt = 0;
-            usb_rows_sent = 0;
-            frame_capture_done = 0;
-        }
+        addr_cnt = 0;
+        href_cnt = 0;
+        usb_rows_sent = 0;
     }
 
     if (DVP->IFR & RB_DVP_IF_STP_FRM)
     {
         DVP->IFR &= ~RB_DVP_IF_STP_FRM;
 
-        /* Trust the camera frame boundary instead of a synthetic row-count cutoff. */
-        if ((frame_capture_done == 0U) && (addr_cnt > 0U))
-        {
-            mark_done = 1;
-            dvp_frame_stop_cnt++;
-        }
-        else
-        {
-            dvp_short_stop_ignored_cnt++;
-        }
+        // /* Stop frame, mark done */
+        // if ((frame_capture_done == 0U) && (addr_cnt > 0U))
+        // {
+        //     mark_done = 1;
+        //     dvp_frame_stop_cnt++;
+        // }
     }
 
     if (DVP->IFR & RB_DVP_IF_FIFO_OV)
@@ -239,7 +202,6 @@ void DVP_IRQHandler(void)
     {
         DVP->CR0 &= ~RB_DVP_ENABLE;
         frame_capture_done = 1;
-        dvp_last_frame_rows = addr_cnt;
         dvp_frame_done_cnt++;
     }
 }
@@ -247,14 +209,12 @@ void DVP_IRQHandler(void)
 int main(void)
 {
     uint32_t last_frame_done_cnt = 0;
-    uint32_t debug_heartbeat = 0;
 
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
     SystemCoreClockUpdate();
     Delay_Init();
     
     UART6_Init(921600);
-    printf("[boot] rgb565 %ux%u build=%s %s\r\n", (unsigned int)IMG_WIDTH, (unsigned int)IMG_HEIGHT, __DATE__, __TIME__);
     Report_Reset_Cause();
     
     USBHS_RCC_Init();
@@ -276,6 +236,8 @@ int main(void)
     Delay_Ms(1000);
 
     RGB565_Mode_Init();
+    Delay_Ms(100);
+    OV2640_OutSize_Set(IMG_WIDTH, IMG_HEIGHT);
     Delay_Ms(1000);
 
     DVP_Init();
@@ -287,38 +249,6 @@ int main(void)
         if (dvp_frame_done_cnt != last_frame_done_cnt)
         {
             last_frame_done_cnt = dvp_frame_done_cnt;
-
-            if ((dvp_frame_done_cnt % 30U) == 0U)
-            {
-                  printf("[dvp] fdone=%lu rows=%lu expect=%u fcnt=%lu addr=%lu href=%lu sent=%lu stop=%lu ov=%lu cr0=0x%08lx\r\n",
-                       (unsigned long)dvp_frame_done_cnt,
-                      (unsigned long)dvp_last_frame_rows,
-                      (unsigned int)IMG_HEIGHT,
-                       (unsigned long)frame_cnt,
-                       (unsigned long)addr_cnt,
-                       (unsigned long)href_cnt,
-                       (unsigned long)usb_rows_sent,
-                       (unsigned long)dvp_frame_stop_cnt,
-                       (unsigned long)dvp_fifo_overflow_cnt,
-                       (unsigned long)DVP->CR0);
-            }
-        }
-
-        debug_heartbeat++;
-        if ((debug_heartbeat % 800000U) == 0U)
-        {
-                 printf("[hb] enum=%u ep3_out=%lu ep3_len=%u ep3_pending=%u ep4_in=%lu tx_busy=%u fcnt=%lu addr=%lu sent=%lu done=%u short_stop=%lu\r\n",
-                   (unsigned int)USBHS_DevEnumStatus,
-                   (unsigned long)USBHS_EP3_Out_Cnt,
-                   (unsigned int)USBHS_EP3_Last_Len,
-                   (unsigned int)USBHS_EP3_Rx_Len,
-                   (unsigned long)USBHS_EP4_In_Cnt,
-                   (unsigned int)(USBHSD->UEP4_TX_CTRL & USBHS_UEP_T_RES_MASK),
-                   (unsigned long)frame_cnt,
-                   (unsigned long)addr_cnt,
-                   (unsigned long)usb_rows_sent,
-                     (unsigned int)frame_capture_done,
-                     (unsigned long)dvp_short_stop_ignored_cnt);
         }
     }
 }

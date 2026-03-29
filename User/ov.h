@@ -99,12 +99,11 @@ typedef volatile unsigned long  *PUINT32V;
 #endif
 
 
-/* RGB565 output: 240x320 (matching reference DVP_UART configuration). */
-#define OV2640_RGB565_WIDTH    240
-#define OV2640_RGB565_HEIGHT   320
-#define RGB565_ROW_NUM         320
-#define RGB565_COL_NUM         480   //Width * 2
-#define OV2640_RGB565_LINE_BYTES   (OV2640_RGB565_WIDTH * 2)
+//RGB565 PIXEL 640*480
+#define RGB565_ROW_NUM   480
+#define RGB565_COL_NUM   1280   //Col * 2
+#define OV2640_RGB565_HEIGHT   480
+#define OV2640_RGB565_WIDTH	   640
 
 //JPEG PIXEL 1024 * 768
 #define OV2640_JPEG_HEIGHT	768
@@ -152,7 +151,6 @@ void OV2640_JPEG_Mode(void);
 void OV2640_RGB565_Mode(void);
 UINT8 OV2640_OutSize_Set(UINT16 Image_width,UINT16 Image_height);
 void OV2640_Speed_Set(UINT8 Pclk_Div, UINT8 Xclk_Div);
-void OV2640_LogCurrentSize(void);
 
 
 

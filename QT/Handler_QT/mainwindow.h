@@ -2,42 +2,40 @@
 #define MAINWINDOW_H
 
 #include <QByteArray>
-#include <QElapsedTimer>
 #include <QLabel>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTextEdit>
 #include <QTimer>
 #include <QWidget>
+#include <atomic>
 #include <cstdint>
-
-struct libusb_context;
-struct libusb_device_handle;
+#include <mutex>
+#include <thread>
+#include "libusb.h"
 
 /* USB constants */
 #define VID 0x1A86
 #define PID 0x5537
 #define EP_OUT 0x03
 #define EP_IN 0x84
-#define USB_CMD_TIMEOUT_MS 100
-#define USB_FRAME_TIMEOUT_MS 120
-#define USB_FIRST_PAYLOAD_TIMEOUT_MS 500
-#define FRAME_READ_TIMEOUT_RETRIES 6
-#define FRAME_RESYNC_MAX_ATTEMPTS 3
-#define USB_DRAIN_PACKET_TIMEOUT_MS 5
-#define USB_DRAIN_MAX_PACKETS 128
+#define TIMEOUT_MS 3000
+#define FRAME_READ_TIMEOUT_RETRIES 4
 
 /* Device mode switch request */
 #define USB_VENDOR_REQUEST_MODE_SWITCH 0x02
 #define USB_REQUEST_TYPE_VENDOR_OUT 0x40
 #define DISPLAY_MODE_VIDEO 3
+#define USB_STREAM_CMD_START 0x01
+#define USB_STREAM_CMD_STOP  0x02
 
-/* Camera frame constants (RGB565 240x320, assembled on host). */
-#define IMG_WIDTH 240
-#define IMG_HEIGHT 320
-#define VIDEO_ROW_HDR_BYTES 7
-#define VIDEO_ROW_PACKET_BYTES (VIDEO_ROW_HDR_BYTES + (IMG_WIDTH * 2))
+/* Camera frame constants for the firmware's RGB565 640x480 stream. */
+#define IMG_WIDTH 640
+#define IMG_HEIGHT 480
+#define LINE_BYTES (IMG_WIDTH * 2)
 #define VIDEO_FRAME_BYTES (IMG_WIDTH * IMG_HEIGHT * 2)
+#define VIDEO_PACKET_HEADER_BYTES 9
+#define USB_PACKET_BYTES 512
 
 class MainWindow : public QWidget
 {
@@ -60,9 +58,10 @@ private:
     void closeUsb();
     bool sendModeSwitch(uint8_t mode);
     bool sendEp3Command(uint8_t cmd);
-    void drainInEndpoint(int maxPackets, int timeoutMs);
     bool readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *readMs);
     void renderRgb565Frame(const QByteArray &frame);
+    void captureLoop();
+    void appendLogMainThread(const QString &msg);
 
     QSpinBox *fpsInput = nullptr;
     QPushButton *startBtn = nullptr;
@@ -75,13 +74,19 @@ private:
     libusb_device_handle *usbHandle = nullptr;
     bool interfaceClaimed = false;
     bool isCapturing = false;
+    std::atomic<bool> stopRequested = false;
+    std::atomic<bool> stopQueued = false;
+    std::thread captureThread;
+    std::mutex frameMutex;
+    QByteArray latestFrame;
+    int latestFirstByteMs = 0;
+    int latestReadMs = 0;
+    bool latestFrameReady = false;
     uint32_t frameCounter = 0;
     uint64_t captureWaitAccumMs = 0;
     uint64_t usbReadAccumMs = 0;
     uint64_t renderAccumMs = 0;
-    uint64_t frameLoopAccumMs = 0;
-    QByteArray rgb565LeFrame;
-    QElapsedTimer perfWindowTimer;
+    uint32_t frameLogCounter = 0;
 };
 
 #endif // MAINWINDOW_H

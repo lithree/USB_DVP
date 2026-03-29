@@ -3,25 +3,24 @@
 
 #include <stdint.h>
 
+#define IMG_WIDTH  640
+#define IMG_HEIGHT 480
+#define LINE_BYTES (IMG_WIDTH * 2)
+#define VIDEO_FRAME_BYTES (IMG_WIDTH * IMG_HEIGHT * 2)
+#define VIDEO_PACKET_HEADER_BYTES 9
+#define VIDEO_PACKET_PAYLOAD_BYTES 503
+
 #define DISPLAY_MODE_VIDEO 3
-
-// 128x64 monochrome SSD1306 frame buffer size (8 pages * 128 columns)
-#define VIDEO_FRAME_BYTES 1024
-
+#define USB_STREAM_CMD_START 0x01
+#define USB_STREAM_CMD_STOP  0x02
 
 extern uint8_t LED_flag;
 extern uint8_t LED_status;
-extern uint8_t current_display_mode;
 
-extern volatile uint16_t Bulk_Out_Len;
-
-/* Mode switch control transfer variables (replaces old EP3 command mechanism) */
 extern volatile uint8_t USBHS_Mode_Switch_Flag;
 extern volatile uint8_t USBHS_Mode_Switch_Value;
 
 
-/******************************************************************************/
-/* external functions */
 void USB_command_check(void);
 void USB_bulk_data_handler(void);
 

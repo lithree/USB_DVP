@@ -11,6 +11,9 @@
 *******************************************************************************/
 #include "ov.h"
 
+#define OV2640_RGB565_PCLK_DIV 2
+#define OV2640_RGB565_XCLK_DIV 1
+
 /* Start Camera list of initialization configuration registers */
 const UINT8 OV2640_InitRegTbl[][2]=
 {
@@ -82,10 +85,11 @@ const UINT8 OV2640_JPEGRegTbl[][2]=
 };
 
 /* RGB565 */
+/* RGB565 */
 const UINT8 OV2640_RGB565RegTbl[][2]=
 {
-	0xFF, 0x00,	0xDA, 0x09,	0xD7, 0x03,	0xDF, 0x02,	0x33, 0xa0,	0x3C, 0x00,	0xe1, 0x67,
-	0xff, 0x01,	0xe0, 0x00,	0xe1, 0x00,	0xe5, 0x00,	0xd7, 0x00,	0xda, 0x00,	0xe0, 0x00,
+    0xFF, 0x00, 0xDA, 0x08, 0xD7, 0x03, 0xDF, 0x02, 0x33, 0xa0, 0x3C, 0x00, 0xe1, 0x67,
+    0xff, 0x01, 0xe0, 0x00, 0xe1, 0x00, 0xe5, 0x00, 0xd7, 0x00, 0xda, 0x00, 0xe0, 0x00,
 };
 /*********************************************************************
  * @fn      SCCB_GPIO_Init
@@ -388,8 +392,8 @@ UINT8 OV2640_Init(void)
 void RGB565_Mode_Init(void)
 {
 	OV2640_RGB565_Mode();
-	OV2640_OutSize_Set(OV2640_RGB565_WIDTH, OV2640_RGB565_HEIGHT);
-	OV2640_Speed_Set(28, 1);
+	OV2640_OutSize_Set(OV2640_RGB565_WIDTH,OV2640_RGB565_HEIGHT);
+	OV2640_Speed_Set(OV2640_RGB565_PCLK_DIV, OV2640_RGB565_XCLK_DIV);
 }
 
 /*********************************************************************
@@ -478,33 +482,6 @@ UINT8 OV2640_OutSize_Set(UINT16 Image_width,UINT16 Image_height)
 	SCCB_WR_Reg(0XE0,0X00);
 
 	return 0;
-}
-
-void OV2640_LogCurrentSize(void)
-{
-	UINT8 zmow;
-	UINT8 zmoh;
-	UINT8 zmhh;
-	UINT8 pclk_div;
-	UINT8 xclk_div;
-
-	SCCB_WR_Reg(0XFF, 0X00);
-	zmow = SCCB_RD_Reg(0X5A);
-	zmoh = SCCB_RD_Reg(0X5B);
-	zmhh = SCCB_RD_Reg(0X5C);
-	pclk_div = SCCB_RD_Reg(0XD3);
-
-	SCCB_WR_Reg(0XFF, 0X01);
-	xclk_div = SCCB_RD_Reg(0X11);
-
-	printf("[ov] req=%ux%u reg5a=0x%02x reg5b=0x%02x reg5c=0x%02x pclk=0x%02x xclk=0x%02x\r\n",
-	       (unsigned int)OV2640_RGB565_WIDTH,
-	       (unsigned int)OV2640_RGB565_HEIGHT,
-	       (unsigned int)zmow,
-	       (unsigned int)zmoh,
-	       (unsigned int)zmhh,
-	       (unsigned int)pclk_div,
-	       (unsigned int)xclk_div);
 }
 
 /*********************************************************************

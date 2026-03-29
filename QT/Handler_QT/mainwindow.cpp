@@ -6,10 +6,14 @@
 #include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
+#include <QMetaObject>
 #include <QPixmap>
 #include <QThread>
 #include <QVBoxLayout>
-#include "libusb.h"
+#include <algorithm>
+#include <cstring>
+#include <QStringList>
+#include <vector>
 
 MainWindow::MainWindow(QWidget *parent)
     : QWidget(parent), videoTimer(new QTimer(this))
@@ -20,7 +24,6 @@ MainWindow::MainWindow(QWidget *parent)
     usbCtx = nullptr;
     usbHandle = nullptr;
     interfaceClaimed = false;
-
     connect(videoTimer, &QTimer::timeout, this, &MainWindow::onVideoTick);
 }
 
@@ -58,7 +61,7 @@ void MainWindow::setupUi()
     mainLayout->addLayout(controlRow);
 
     previewLabel = new QLabel("No frame yet");
-    previewLabel->setMinimumSize(IMG_WIDTH, IMG_HEIGHT);
+    previewLabel->setMinimumSize(IMG_WIDTH * 2, IMG_HEIGHT * 2);
     previewLabel->setAlignment(Qt::AlignCenter);
     previewLabel->setStyleSheet("QLabel { background: #111; color: #bbb; border: 1px solid #333; }");
     mainLayout->addWidget(previewLabel);
@@ -79,6 +82,19 @@ void MainWindow::logMessage(const QString &msg)
 {
     const QString ts = QDateTime::currentDateTime().toString("hh:mm:ss");
     consoleLog->append(QString("[%1] %2").arg(ts, msg));
+}
+
+void MainWindow::appendLogMainThread(const QString &msg)
+{
+    if (QThread::currentThread() == thread())
+    {
+        logMessage(msg);
+        return;
+    }
+
+    QMetaObject::invokeMethod(this, [this, msg]() {
+        logMessage(msg);
+    }, Qt::QueuedConnection);
 }
 
 bool MainWindow::initUsb()
@@ -148,46 +164,11 @@ bool MainWindow::recoverUsbSession()
     if (!sendModeSwitch(DISPLAY_MODE_VIDEO))
         return false;
 
-    sendEp3Command(0x02);
-    QThread::msleep(20);
-    drainInEndpoint(USB_DRAIN_MAX_PACKETS, USB_DRAIN_PACKET_TIMEOUT_MS);
-
-    if (!sendEp3Command(0x01))
+    if (!sendEp3Command(USB_STREAM_CMD_START))
         return false;
 
     logMessage("USB reconnect succeeded.");
     return true;
-}
-
-void MainWindow::drainInEndpoint(int maxPackets, int timeoutMs)
-{
-    if (!interfaceClaimed || !usbHandle)
-        return;
-
-    unsigned char buffer[512];
-    for (int packet = 0; packet < maxPackets; ++packet)
-    {
-        int transferred = 0;
-        const int res = libusb_bulk_transfer(
-            usbHandle,
-            EP_IN,
-            buffer,
-            sizeof(buffer),
-            &transferred,
-            timeoutMs);
-
-        if (res == LIBUSB_ERROR_TIMEOUT || transferred <= 0)
-            break;
-
-        if (res == LIBUSB_ERROR_PIPE)
-        {
-            libusb_clear_halt(usbHandle, EP_IN);
-            break;
-        }
-
-        if (res < 0)
-            break;
-    }
 }
 
 bool MainWindow::sendModeSwitch(uint8_t mode)
@@ -203,7 +184,7 @@ bool MainWindow::sendModeSwitch(uint8_t mode)
         0,
         nullptr,
         0,
-        USB_CMD_TIMEOUT_MS);
+        TIMEOUT_MS);
 
     if (res < 0)
     {
@@ -218,43 +199,23 @@ bool MainWindow::sendEp3Command(uint8_t cmd)
     if (!interfaceClaimed || !usbHandle)
         return false;
 
+    int transferred = 0;
     unsigned char payload[1] = {cmd};
-    int lastErr = LIBUSB_ERROR_OTHER;
+    int res = libusb_bulk_transfer(
+        usbHandle,
+        EP_OUT,
+        payload,
+        1,
+        &transferred,
+        TIMEOUT_MS);
 
-    for (int attempt = 1; attempt <= 3; ++attempt)
+    if (res < 0 || transferred != 1)
     {
-        int transferred = 0;
-        const int res = libusb_bulk_transfer(
-            usbHandle,
-            EP_OUT,
-            payload,
-            1,
-            &transferred,
-            USB_CMD_TIMEOUT_MS);
-
-        if (res == 0 && transferred == 1)
-            return true;
-
-        lastErr = res;
-
-        if (res == LIBUSB_ERROR_PIPE)
-        {
-            libusb_clear_halt(usbHandle, EP_OUT);
-        }
-
-        if (res == LIBUSB_ERROR_TIMEOUT || res == LIBUSB_ERROR_PIPE)
-        {
-            QThread::msleep(20);
-            continue;
-        }
-
-        break;
+        logMessage(QString("EP3 command send failed: %1").arg(libusb_error_name(res)));
+        return false;
     }
 
-    logMessage(QString("EP3 command 0x%1 send failed after retries: %2")
-                   .arg(cmd, 2, 16, QLatin1Char('0'))
-                   .arg(libusb_error_name(lastErr)));
-    return false;
+    return true;
 }
 
 bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *readMs)
@@ -268,8 +229,14 @@ bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *re
     QElapsedTimer readTimer;
     readTimer.start();
     bool firstPayloadSeen = false;
-    QByteArray packet(VIDEO_ROW_PACKET_BYTES, 0);
-    uint8_t rowSeen[IMG_HEIGHT] = {0};
+    QByteArray packet(USB_PACKET_BYTES, 0);
+    std::vector<int> rowBytes(IMG_HEIGHT, 0);
+    std::vector<QStringList> rowChunkLogs(3);
+    int packetCount = 0;
+    int shortPacketCount = 0;
+    int frameSwitchCount = 0;
+    int restartCount = 0;
+    int anomalyLogCount = 0;
 
     if (firstByteMs)
         *firstByteMs = -1;
@@ -277,157 +244,200 @@ bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *re
         *readMs = 0;
 
     int assembledRows = 0;
+    int targetFrameId = -1;
     int timeoutRetries = 0;
-    int resyncAttempts = 0;
     bool haltRecovered = false;
     bool deviceRecovered = false;
-
-    int targetFrameId = -1;
+    bool frameRestarted = false;
     while (assembledRows < IMG_HEIGHT)
     {
-        int packetOffset = 0;
-        while (packetOffset < VIDEO_ROW_PACKET_BYTES)
+        int transferred = 0;
+        int res = libusb_bulk_transfer(
+            usbHandle,
+            EP_IN,
+            reinterpret_cast<unsigned char *>(packet.data()),
+            USB_PACKET_BYTES,
+            &transferred,
+            TIMEOUT_MS);
+
+        if (res < 0)
         {
-            int transferred = 0;
-            const unsigned int transferTimeout = firstPayloadSeen ? USB_FRAME_TIMEOUT_MS : USB_FIRST_PAYLOAD_TIMEOUT_MS;
-            int res = libusb_bulk_transfer(
-                usbHandle,
-                EP_IN,
-                reinterpret_cast<unsigned char *>(packet.data() + packetOffset),
-                VIDEO_ROW_PACKET_BYTES - packetOffset,
-                &transferred,
-                transferTimeout);
-
-            if (res < 0)
+            if ((res == LIBUSB_ERROR_NO_DEVICE) && !deviceRecovered)
             {
-                if ((res == LIBUSB_ERROR_NO_DEVICE) && !deviceRecovered)
+                if (!recoverUsbSession())
                 {
-                    if (!recoverUsbSession())
-                    {
-                        logMessage("USB reconnect failed.");
-                        return false;
-                    }
-
-                    assembledRows = 0;
-                    memset(rowSeen, 0, sizeof(rowSeen));
-                    targetFrameId = -1;
-                    packetOffset = 0;
-                    timeoutRetries = 0;
-                    haltRecovered = false;
-                    deviceRecovered = true;
-                    continue;
+                    appendLogMainThread("USB reconnect failed.");
+                    return false;
                 }
 
-                if ((res == LIBUSB_ERROR_PIPE) && !haltRecovered)
+                assembledRows = 0;
+                std::fill(rowBytes.begin(), rowBytes.end(), 0);
+                targetFrameId = -1;
+                timeoutRetries = 0;
+                haltRecovered = false;
+                deviceRecovered = true;
+                restartCount++;
+                if (anomalyLogCount < 5)
                 {
-                    libusb_clear_halt(usbHandle, EP_IN);
-                    sendEp3Command(0x01);
-                    haltRecovered = true;
-                    continue;
+                    appendLogMainThread("readCameraFrame: device reconnect, frame assembly reset.");
+                    anomalyLogCount++;
+                }
+                continue;
+            }
+
+            if ((res == LIBUSB_ERROR_PIPE) && !haltRecovered)
+            {
+                libusb_clear_halt(usbHandle, EP_IN);
+                sendEp3Command(USB_STREAM_CMD_START);
+                haltRecovered = true;
+                continue;
+            }
+
+            if ((res == LIBUSB_ERROR_TIMEOUT) && !frameRestarted)
+            {
+                sendEp3Command(USB_STREAM_CMD_STOP);
+                if (!sendEp3Command(USB_STREAM_CMD_START))
+                {
+                    appendLogMainThread("Frame restart request failed.");
+                    return false;
                 }
 
-                if (res == LIBUSB_ERROR_TIMEOUT && timeoutRetries < FRAME_READ_TIMEOUT_RETRIES)
+                assembledRows = 0;
+                std::fill(rowBytes.begin(), rowBytes.end(), 0);
+                targetFrameId = -1;
+                timeoutRetries = 0;
+                haltRecovered = false;
+                deviceRecovered = false;
+                frameRestarted = true;
+                restartCount++;
+                if (anomalyLogCount < 5)
                 {
-                    timeoutRetries++;
-                    continue;
-                }
-
-                if ((res == LIBUSB_ERROR_TIMEOUT) && (resyncAttempts < FRAME_RESYNC_MAX_ATTEMPTS))
-                {
-                    const bool gotPartialFrame = firstPayloadSeen;
-                    logMessage(QString("Frame timeout after %1 ms (%2, rows=%3/%4, packet=%5/%6). Resync %7/%8.")
-                                   .arg(readTimer.elapsed())
-                                   .arg(gotPartialFrame ? "partial frame" : "no first payload")
+                    appendLogMainThread(QString("readCameraFrame: timeout, restart stream at rows=%1 packets=%2")
                                    .arg(assembledRows)
-                                   .arg(IMG_HEIGHT)
-                                   .arg(packetOffset)
-                                   .arg(VIDEO_ROW_PACKET_BYTES)
-                                   .arg(resyncAttempts + 1)
-                                   .arg(FRAME_RESYNC_MAX_ATTEMPTS));
-
-                    sendEp3Command(0x02);
-                    QThread::msleep(20);
-                    drainInEndpoint(USB_DRAIN_MAX_PACKETS, USB_DRAIN_PACKET_TIMEOUT_MS);
-                    if (!sendEp3Command(0x01))
-                    {
-                        logMessage("Frame restart request failed.");
-                        return false;
-                    }
-
-                    QThread::msleep(40);
-
-                    assembledRows = 0;
-                    memset(rowSeen, 0, sizeof(rowSeen));
-                    targetFrameId = -1;
-                    packetOffset = 0;
-                    timeoutRetries = 0;
-                    resyncAttempts++;
-                    haltRecovered = false;
-                    deviceRecovered = false;
-                    firstPayloadSeen = false;
-                    readTimer.restart();
-                    if (firstByteMs)
-                        *firstByteMs = -1;
-                    continue;
+                                   .arg(packetCount));
+                    anomalyLogCount++;
                 }
-
-                logMessage(QString("USB IN transfer failed: %1").arg(libusb_error_name(res)));
-                return false;
+                continue;
             }
 
-            if (transferred <= 0)
+            if (res == LIBUSB_ERROR_TIMEOUT && timeoutRetries < FRAME_READ_TIMEOUT_RETRIES)
             {
-                if (timeoutRetries < FRAME_READ_TIMEOUT_RETRIES)
-                {
-                    timeoutRetries++;
-                    continue;
-                }
-
-                logMessage("USB IN transfer timeout.");
-                return false;
+                timeoutRetries++;
+                continue;
             }
 
-            if (!firstPayloadSeen)
-            {
-                firstPayloadSeen = true;
-                if (firstByteMs)
-                    *firstByteMs = static_cast<int>(readTimer.elapsed());
-            }
-
-            packetOffset += transferred;
-            timeoutRetries = 0;
-            haltRecovered = false;
-            deviceRecovered = false;
+            appendLogMainThread(QString("USB IN transfer failed: %1").arg(libusb_error_name(res)));
+            return false;
         }
 
-        if (memcmp(packet.constData(), "OV26", 4) != 0)
+        frameRestarted = false;
+        packetCount++;
+
+        if (transferred <= 0)
         {
-            logMessage("USB row packet lost sync. Draining and retrying.");
-            sendEp3Command(0x02);
-            QThread::msleep(20);
-            drainInEndpoint(USB_DRAIN_MAX_PACKETS, USB_DRAIN_PACKET_TIMEOUT_MS);
-            if (!sendEp3Command(0x01))
+            if (timeoutRetries < FRAME_READ_TIMEOUT_RETRIES)
             {
-                logMessage("Frame restart request failed after sync loss.");
+                timeoutRetries++;
+                continue;
+            }
+
+            appendLogMainThread("USB IN transfer timeout.");
+            return false;
+        }
+
+        if (!firstPayloadSeen)
+        {
+            firstPayloadSeen = true;
+            if (firstByteMs)
+                *firstByteMs = static_cast<int>(readTimer.elapsed());
+        }
+
+        if (transferred <= VIDEO_PACKET_HEADER_BYTES)
+        {
+            shortPacketCount++;
+            sendEp3Command(USB_STREAM_CMD_STOP);
+            if (!sendEp3Command(USB_STREAM_CMD_START))
+            {
+                appendLogMainThread("Short USB packet during frame receive.");
                 return false;
+            }
+
+            if (anomalyLogCount < 5)
+            {
+                appendLogMainThread(QString("Short packet: len=%1 rows=%2 packets=%3")
+                               .arg(transferred)
+                               .arg(assembledRows)
+                               .arg(packetCount));
+                anomalyLogCount++;
             }
 
             assembledRows = 0;
-            memset(rowSeen, 0, sizeof(rowSeen));
+            std::fill(rowBytes.begin(), rowBytes.end(), 0);
             targetFrameId = -1;
             timeoutRetries = 0;
-            resyncAttempts++;
-            firstPayloadSeen = false;
-            readTimer.restart();
             continue;
         }
 
-        const uint8_t frameId = static_cast<uint8_t>(packet[4]);
-        const uint16_t rowIndex = static_cast<uint8_t>(packet[5]) |
-                                  (static_cast<uint16_t>(static_cast<uint8_t>(packet[6])) << 8);
-
-        if (rowIndex >= IMG_HEIGHT)
+        const unsigned char *src = reinterpret_cast<const unsigned char *>(packet.constData());
+        if (src[0] != 'O' || src[1] != 'V' || src[2] != '2' || src[3] != '6')
         {
+            sendEp3Command(USB_STREAM_CMD_STOP);
+            if (!sendEp3Command(USB_STREAM_CMD_START))
+            {
+                appendLogMainThread("USB stream sync lost.");
+                return false;
+            }
+
+            if (anomalyLogCount < 5)
+            {
+                appendLogMainThread(QString("Sync lost: hdr=%1 %2 %3 %4 len=%5 rows=%6 packets=%7")
+                               .arg(static_cast<unsigned int>(src[0]), 2, 16, QLatin1Char('0'))
+                               .arg(static_cast<unsigned int>(src[1]), 2, 16, QLatin1Char('0'))
+                               .arg(static_cast<unsigned int>(src[2]), 2, 16, QLatin1Char('0'))
+                               .arg(static_cast<unsigned int>(src[3]), 2, 16, QLatin1Char('0'))
+                               .arg(transferred)
+                               .arg(assembledRows)
+                               .arg(packetCount));
+                anomalyLogCount++;
+            }
+
+            assembledRows = 0;
+            std::fill(rowBytes.begin(), rowBytes.end(), 0);
+            targetFrameId = -1;
+            timeoutRetries = 0;
+            continue;
+        }
+
+        const int frameId = src[4];
+        const int rowIndex = src[5] | (src[6] << 8);
+        const int rowOffset = src[7] | (src[8] << 8);
+        const int payloadLen = transferred - VIDEO_PACKET_HEADER_BYTES;
+
+        if (rowIndex < 0 || rowIndex >= IMG_HEIGHT || rowOffset < 0 || rowOffset >= LINE_BYTES ||
+            payloadLen <= 0 || (rowOffset + payloadLen) > LINE_BYTES)
+        {
+            sendEp3Command(USB_STREAM_CMD_STOP);
+            if (!sendEp3Command(USB_STREAM_CMD_START))
+            {
+                appendLogMainThread("Invalid row packet metadata.");
+                return false;
+            }
+
+            if (anomalyLogCount < 5)
+            {
+                appendLogMainThread(QString("Invalid metadata: fid=%1 row=%2 off=%3 payload=%4 len=%5")
+                               .arg(frameId)
+                               .arg(rowIndex)
+                               .arg(rowOffset)
+                               .arg(payloadLen)
+                               .arg(transferred));
+                anomalyLogCount++;
+            }
+
+            assembledRows = 0;
+            std::fill(rowBytes.begin(), rowBytes.end(), 0);
+            targetFrameId = -1;
+            timeoutRetries = 0;
             continue;
         }
 
@@ -437,21 +447,69 @@ bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *re
         }
         else if (frameId != targetFrameId)
         {
-            memset(rowSeen, 0, sizeof(rowSeen));
-            assembledRows = 0;
+            frameSwitchCount++;
+            if (anomalyLogCount < 5)
+            {
+                appendLogMainThread(QString("Frame switch during assembly: old=%1 new=%2 rows=%3 packets=%4")
+                               .arg(targetFrameId)
+                               .arg(frameId)
+                               .arg(assembledRows)
+                               .arg(packetCount));
+                anomalyLogCount++;
+            }
             targetFrameId = frameId;
+            assembledRows = 0;
+            std::fill(rowBytes.begin(), rowBytes.end(), 0);
+            frameOut.fill(0);
         }
 
-        if (rowSeen[rowIndex] == 0U)
+        if (rowOffset != rowBytes[static_cast<size_t>(rowIndex)])
         {
-            memcpy(frameOut.data() + (rowIndex * (IMG_WIDTH * 2)),
-                   packet.constData() + VIDEO_ROW_HDR_BYTES,
-                   (IMG_WIDTH * 2));
-            rowSeen[rowIndex] = 1U;
+            sendEp3Command(USB_STREAM_CMD_STOP);
+            if (!sendEp3Command(USB_STREAM_CMD_START))
+            {
+                appendLogMainThread("Row packet order mismatch.");
+                return false;
+            }
+
+            if (anomalyLogCount < 5)
+            {
+                appendLogMainThread(QString("Row mismatch: fid=%1 row=%2 expect_off=%3 got_off=%4 payload=%5")
+                               .arg(frameId)
+                               .arg(rowIndex)
+                               .arg(rowBytes[static_cast<size_t>(rowIndex)])
+                               .arg(rowOffset)
+                               .arg(payloadLen));
+                anomalyLogCount++;
+            }
+
+            assembledRows = 0;
+            std::fill(rowBytes.begin(), rowBytes.end(), 0);
+            targetFrameId = -1;
+            frameOut.fill(0);
+            timeoutRetries = 0;
+            continue;
+        }
+
+        memcpy(frameOut.data() + (rowIndex * LINE_BYTES) + rowOffset,
+               packet.constData() + VIDEO_PACKET_HEADER_BYTES,
+               static_cast<size_t>(payloadLen));
+
+        if (rowIndex >= 0 && rowIndex < 3 && rowChunkLogs[static_cast<size_t>(rowIndex)].size() < 6)
+        {
+            rowChunkLogs[static_cast<size_t>(rowIndex)].append(
+                QString("off=%1 len=%2").arg(rowOffset).arg(payloadLen));
+        }
+
+        rowBytes[static_cast<size_t>(rowIndex)] += payloadLen;
+        if (rowBytes[static_cast<size_t>(rowIndex)] == LINE_BYTES)
+        {
             assembledRows++;
         }
 
-        resyncAttempts = 0;
+        timeoutRetries = 0;
+        haltRecovered = false;
+        deviceRecovered = false;
     }
 
     if (readMs)
@@ -462,15 +520,31 @@ bool MainWindow::readCameraFrame(QByteArray &frameOut, int *firstByteMs, int *re
 
 void MainWindow::renderRgb565Frame(const QByteArray &frame)
 {
-    /* OV2640 with 0xDA=0x09 outputs byte-swapped (little-endian) RGB565,
-     * which matches Qt's Format_RGB16 on little-endian hosts directly. */
-    QImage img(reinterpret_cast<const uchar *>(frame.constData()),
-               IMG_WIDTH,
-               IMG_HEIGHT,
-               IMG_WIDTH * 2,
-               QImage::Format_RGB16);
+    QImage img(IMG_WIDTH, IMG_HEIGHT, QImage::Format_RGB888);
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(frame.constData());
 
-    previewLabel->setPixmap(QPixmap::fromImage(img));
+    for (int y = 0; y < IMG_HEIGHT; ++y)
+    {
+        uchar *dst = img.scanLine(y);
+        for (int x = 0; x < IMG_WIDTH; ++x)
+        {
+            const uint16_t p = (static_cast<uint16_t>(src[0]) << 8) | src[1];
+            src += 2;
+
+            const uint8_t r = static_cast<uint8_t>(((p >> 11) & 0x1F) * 255 / 31);
+            const uint8_t g = static_cast<uint8_t>(((p >> 5) & 0x3F) * 255 / 63);
+            const uint8_t b = static_cast<uint8_t>((p & 0x1F) * 255 / 31);
+
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+            dst += 3;
+        }
+    }
+
+    QPixmap pix = QPixmap::fromImage(img).scaled(
+        previewLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
+    previewLabel->setPixmap(pix);
 }
 
 void MainWindow::startCapture()
@@ -487,12 +561,7 @@ void MainWindow::startCapture()
         return;
     }
 
-    sendEp3Command(0x02);
-    QThread::msleep(20);
-    drainInEndpoint(USB_DRAIN_MAX_PACKETS, USB_DRAIN_PACKET_TIMEOUT_MS);
-    QThread::msleep(20);
-
-    if (!sendEp3Command(0x01))
+    if (!sendEp3Command(USB_STREAM_CMD_START))
     {
         logMessage("Initial frame stream start failed.");
         closeUsb();
@@ -500,22 +569,27 @@ void MainWindow::startCapture()
     }
 
     int fps = fpsInput->value();
-    int intervalMs = qMax(1, 1000 / fps);
 
     isCapturing = true;
+    stopRequested.store(false);
+    stopQueued.store(false);
+    latestFrame.clear();
+    latestFrameReady = false;
+    latestFirstByteMs = 0;
+    latestReadMs = 0;
     frameCounter = 0;
+    frameLogCounter = 0;
     captureWaitAccumMs = 0;
     usbReadAccumMs = 0;
     renderAccumMs = 0;
-    frameLoopAccumMs = 0;
-    perfWindowTimer.start();
-    videoTimer->start(intervalMs);
+    captureThread = std::thread(&MainWindow::captureLoop, this);
+    videoTimer->start(16);
 
     startBtn->setEnabled(false);
     stopBtn->setEnabled(true);
     fpsInput->setEnabled(false);
 
-    logMessage(QString("Capture started at %1 FPS poll.").arg(fps));
+    logMessage(QString("Capture started in continuous mode (UI setting %1 FPS).").arg(fps));
 }
 
 void MainWindow::stopCapture()
@@ -524,7 +598,18 @@ void MainWindow::stopCapture()
         return;
 
     isCapturing = false;
+    stopRequested.store(true);
     videoTimer->stop();
+
+    if (captureThread.joinable())
+    {
+        captureThread.join();
+    }
+
+    if (interfaceClaimed && usbHandle)
+    {
+        sendEp3Command(USB_STREAM_CMD_STOP);
+    }
 
     closeUsb();
 
@@ -535,58 +620,88 @@ void MainWindow::stopCapture()
     logMessage("Capture stopped.");
 }
 
+void MainWindow::captureLoop()
+{
+    while (!stopRequested.load())
+    {
+        QByteArray frame;
+        int firstByteMs = 0;
+        int readMs = 0;
+        if (!readCameraFrame(frame, &firstByteMs, &readMs))
+        {
+            if (!stopRequested.load() && !stopQueued.exchange(true))
+            {
+                QMetaObject::invokeMethod(this, [this]() {
+                    logMessage("Frame receive failed. Stopping capture.");
+                    stopCapture();
+                }, Qt::QueuedConnection);
+            }
+            return;
+        }
+
+        if (stopRequested.load())
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(frameMutex);
+            latestFrame = frame;
+            latestFirstByteMs = firstByteMs;
+            latestReadMs = readMs;
+            latestFrameReady = true;
+        }
+    }
+}
+
 void MainWindow::onVideoTick()
 {
     if (!isCapturing)
-        return;
-
-    QElapsedTimer frameLoopTimer;
-    frameLoopTimer.start();
-
-    QElapsedTimer renderTimer;
-    QByteArray frame;
-    int firstByteMs = 0;
-    int readMs = 0;
-    if (!readCameraFrame(frame, &firstByteMs, &readMs))
     {
-        logMessage("Frame receive failed. Stopping capture.");
-        stopCapture();
         return;
     }
 
+    QByteArray frameToRender;
+    int firstByteMs = 0;
+    int readMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(frameMutex);
+        if (!latestFrameReady)
+        {
+            return;
+        }
+
+        frameToRender = latestFrame;
+        firstByteMs = latestFirstByteMs;
+        readMs = latestReadMs;
+        latestFrameReady = false;
+    }
+
+    QElapsedTimer renderTimer;
     renderTimer.start();
-    renderRgb565Frame(frame);
+    renderRgb565Frame(frameToRender);
     const int renderMs = static_cast<int>(renderTimer.elapsed());
-    const int frameLoopMs = static_cast<int>(frameLoopTimer.elapsed());
 
     frameCounter++;
+    frameLogCounter++;
     captureWaitAccumMs += static_cast<uint64_t>(qMax(0, firstByteMs));
     usbReadAccumMs += static_cast<uint64_t>(qMax(0, readMs));
     renderAccumMs += static_cast<uint64_t>(qMax(0, renderMs));
-    frameLoopAccumMs += static_cast<uint64_t>(qMax(0, frameLoopMs));
 
-    if ((frameCounter % 30U) == 0U)
+    if ((frameLogCounter % 30U) == 0U)
     {
         const uint64_t sampleCount = 30U;
-        const qint64 windowMs = qMax<qint64>(1, perfWindowTimer.elapsed());
-        const double achievedFps = (sampleCount * 1000.0) / static_cast<double>(windowMs);
         const double usbMBps =
             (static_cast<double>(VIDEO_FRAME_BYTES) * static_cast<double>(sampleCount) * 1000.0) /
             (static_cast<double>(qMax<uint64_t>(1U, usbReadAccumMs)) * 1024.0 * 1024.0);
 
-        logMessage(QString("Captured %1 frames. avg first-byte=%2 ms, avg usb-read=%3 ms, avg render=%4 ms, avg loop=%5 ms, fps=%6, usb=%7 MB/s")
+        logMessage(QString("Captured %1 frames. avg first-byte=%2 ms, avg usb-read=%3 ms, avg render=%4 ms, usb=%5 MiB/s")
                        .arg(frameCounter)
                        .arg(captureWaitAccumMs / sampleCount)
                        .arg(usbReadAccumMs / sampleCount)
                        .arg(renderAccumMs / sampleCount)
-                       .arg(frameLoopAccumMs / sampleCount)
-                       .arg(achievedFps, 0, 'f', 1)
                        .arg(usbMBps, 0, 'f', 2));
-
-        perfWindowTimer.restart();
         captureWaitAccumMs = 0;
         usbReadAccumMs = 0;
         renderAccumMs = 0;
-        frameLoopAccumMs = 0;
     }
 }
